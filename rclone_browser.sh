@@ -47,6 +47,27 @@ init_environment() {
         echo "Install it with: sudo apt install jq"
         exit 1
     fi
+    
+    # Recover any stuck downloading items (from previous crash)
+    local downloading_count=$(jq '.downloading | length' "$QUEUE_FILE" 2>/dev/null || echo "0")
+    if [[ $downloading_count -gt 0 ]]; then
+        echo -e "${YELLOW}Recovering $downloading_count stuck download(s)...${NC}"
+        recover_downloading
+    fi
+}
+
+# =============================================================================
+# FILE LOCKING
+# =============================================================================
+
+LOCK_FILE="$LOG_DIR/queue.lock"
+
+queue_locked() {
+    # Execute a command with exclusive lock on queue
+    (
+        flock -x 200
+        eval "$@"
+    ) 200>"$LOCK_FILE"
 }
 
 # =============================================================================
@@ -77,55 +98,76 @@ add_to_queue() {
     local timestamp=$(date -Iseconds)
     local id=$(date +%s%N | md5sum | head -c 8)
     
-    local tmp_file=$(mktemp)
-    jq --arg id "$id" \
-       --arg remote "$remote_path" \
-       --arg local "$local_path" \
-       --arg size "$size" \
-       --arg name "$filename" \
-       --arg ts "$timestamp" \
-       '.pending += [{
-           "id": $id,
-           "remote_path": $remote,
-           "local_path": $local,
-           "size": ($size | tonumber),
-           "filename": $name,
-           "added_at": $ts,
-           "retries": 0
-       }]' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+    queue_locked "
+        tmp_file=\$(mktemp)
+        jq --arg id '$id' \
+           --arg remote '$remote_path' \
+           --arg local '$local_path' \
+           --arg size '$size' \
+           --arg name '$filename' \
+           --arg ts '$timestamp' \
+           '.pending += [{
+               \"id\": \$id,
+               \"remote_path\": \$remote,
+               \"local_path\": \$local,
+               \"size\": (\$size | tonumber),
+               \"filename\": \$name,
+               \"added_at\": \$ts,
+               \"retries\": 0
+           }]' '$QUEUE_FILE' > \"\$tmp_file\" && mv \"\$tmp_file\" '$QUEUE_FILE'
+    "
 }
 
 remove_from_queue() {
     local index=$1
-    local tmp_file=$(mktemp)
-    jq --argjson idx "$index" 'del(.pending[$idx])' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+    queue_locked "
+        tmp_file=\$(mktemp)
+        jq --argjson idx '$index' 'del(.pending[\$idx])' '$QUEUE_FILE' > \"\$tmp_file\" && mv \"\$tmp_file\" '$QUEUE_FILE'
+    "
 }
 
 clear_pending_queue() {
-    local tmp_file=$(mktemp)
-    jq '.pending = []' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+    queue_locked "
+        tmp_file=\$(mktemp)
+        jq '.pending = []' '$QUEUE_FILE' > \"\$tmp_file\" && mv \"\$tmp_file\" '$QUEUE_FILE'
+    "
 }
 
 set_paused() {
     local state=$1
-    local tmp_file=$(mktemp)
-    jq --argjson paused "$state" '.paused = $paused' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+    queue_locked "
+        tmp_file=\$(mktemp)
+        jq --argjson paused '$state' '.paused = \$paused' '$QUEUE_FILE' > \"\$tmp_file\" && mv \"\$tmp_file\" '$QUEUE_FILE'
+    "
 }
 
 clear_completed() {
-    local tmp_file=$(mktemp)
-    jq '.completed = []' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+    queue_locked "
+        tmp_file=\$(mktemp)
+        jq '.completed = []' '$QUEUE_FILE' > \"\$tmp_file\" && mv \"\$tmp_file\" '$QUEUE_FILE'
+    "
 }
 
 clear_failed() {
-    local tmp_file=$(mktemp)
-    jq '.failed = []' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+    queue_locked "
+        tmp_file=\$(mktemp)
+        jq '.failed = []' '$QUEUE_FILE' > \"\$tmp_file\" && mv \"\$tmp_file\" '$QUEUE_FILE'
+    "
 }
 
 retry_failed() {
-    local tmp_file=$(mktemp)
-    # Move all failed items back to pending with reset retries
-    jq '.pending += [.failed[] | .retries = 0] | .failed = []' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+    queue_locked "
+        tmp_file=\$(mktemp)
+        jq '.pending += [.failed[] | .retries = 0] | .failed = []' '$QUEUE_FILE' > \"\$tmp_file\" && mv \"\$tmp_file\" '$QUEUE_FILE'
+    "
+}
+
+recover_downloading() {
+    # Move any stuck downloading items back to pending
+    queue_locked "
+        tmp_file=\$(mktemp)
+        jq '.pending = .downloading + .pending | .downloading = []' '$QUEUE_FILE' > \"\$tmp_file\" && mv \"\$tmp_file\" '$QUEUE_FILE'
+    "
 }
 
 # =============================================================================
@@ -133,13 +175,10 @@ retry_failed() {
 # =============================================================================
 
 is_worker_running() {
-    if [[ -f "$WORKER_PID_FILE" ]]; then
-        local pid=$(cat "$WORKER_PID_FILE")
-        if ps -p "$pid" > /dev/null 2>&1; then
-            return 0
-        fi
-    fi
-    return 1
+    [[ -f "$WORKER_PID_FILE" ]] || return 1
+    local pid
+    pid=$(cat "$WORKER_PID_FILE" 2>/dev/null || echo "")
+    [[ -n "$pid" && -d "/proc/$pid" ]]
 }
 
 start_worker() {
@@ -160,7 +199,7 @@ start_worker() {
 stop_worker() {
     if [[ -f "$WORKER_PID_FILE" ]]; then
         local pid=$(cat "$WORKER_PID_FILE")
-        if ps -p "$pid" > /dev/null 2>&1; then
+        if [[ -n "$pid" && -d "/proc/$pid" ]]; then
             kill "$pid" 2>/dev/null
             echo -e "${YELLOW}Worker stopped.${NC}"
         fi
@@ -382,8 +421,10 @@ show_status() {
         kd)
             # Kill downloads and delete from queue
             pkill -f "rclone copy" 2>/dev/null
-            local tmp_file=$(mktemp)
-            jq '.downloading = []' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+            queue_locked "
+                tmp_file=\$(mktemp)
+                jq '.downloading = []' '$QUEUE_FILE' > \"\$tmp_file\" && mv \"\$tmp_file\" '$QUEUE_FILE'
+            "
             echo -e "${RED}Downloads killed and removed from queue.${NC}"
             sleep 1
             show_status
@@ -391,8 +432,10 @@ show_status() {
         kp)
             # Kill downloads and move back to pending
             pkill -f "rclone copy" 2>/dev/null
-            local tmp_file=$(mktemp)
-            jq '.pending = .downloading + .pending | .downloading = []' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+            queue_locked "
+                tmp_file=\$(mktemp)
+                jq '.pending = .downloading + .pending | .downloading = []' '$QUEUE_FILE' > \"\$tmp_file\" && mv \"\$tmp_file\" '$QUEUE_FILE'
+            "
             echo -e "${YELLOW}Downloads killed and moved back to pending queue.${NC}"
             sleep 1
             show_status
@@ -402,8 +445,10 @@ show_status() {
             pkill -f "rclone_worker.sh" 2>/dev/null
             pkill -f "rclone copy" 2>/dev/null
             rm -f "$WORKER_PID_FILE"
-            local tmp_file=$(mktemp)
-            jq '.pending = .downloading + .pending | .downloading = [] | .paused = true' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+            queue_locked "
+                tmp_file=\$(mktemp)
+                jq '.pending = .downloading + .pending | .downloading = [] | .paused = true' '$QUEUE_FILE' > \"\$tmp_file\" && mv \"\$tmp_file\" '$QUEUE_FILE'
+            "
             echo -e "${RED}All downloads killed, queue paused.${NC}"
             echo -e "Use ${GREEN}resume${NC} to restart."
             sleep 2
