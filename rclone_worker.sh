@@ -296,14 +296,15 @@ main() {
         local available_slots=$((2 - downloading_count))
         
         if [[ "$use_multithread" == "true" ]]; then
-            # Single item mode - download with 2 streams
+            # Single item mode - download with 2 streams (blocking)
             local item=$(jq -c '.pending[0]' "$QUEUE_FILE")
             if [[ -n "$item" && "$item" != "null" ]]; then
-                download_file "$item" "true" &
+                download_file "$item" "true"
             fi
         else
             # Multi-item mode - download up to 2 items with 1 stream each
             local items_to_download=()
+            local pids=()
             
             while IFS= read -r item; do
                 if [[ -n "$item" && "$item" != "null" ]]; then
@@ -311,14 +312,21 @@ main() {
                 fi
             done < <(jq -c ".pending[0:$available_slots][]" "$QUEUE_FILE")
             
+            # Start downloads in background and collect PIDs
             for item in "${items_to_download[@]}"; do
                 download_file "$item" "false" &
+                pids+=($!)
                 sleep 1  # Small delay between starting downloads
+            done
+            
+            # Wait for ALL downloads to complete before continuing
+            for pid in "${pids[@]}"; do
+                wait $pid
             done
         fi
         
-        # Wait a bit before next check
-        sleep $POLL_INTERVAL
+        # Brief pause before next iteration
+        sleep 2
     done
 }
 
