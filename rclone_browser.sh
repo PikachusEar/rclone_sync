@@ -318,8 +318,9 @@ show_status() {
     fi
     
     echo -e "${CYAN}───────────────────────────────────────────────────────────────────${NC}"
-    echo -e "Commands: ${GREEN}r <num>${NC} remove | ${YELLOW}c${NC} clear pending | ${MAGENTA}retry${NC} retry failed"
+    echo -e "Commands: ${GREEN}r <num>${NC} remove pending | ${YELLOW}c${NC} clear pending | ${MAGENTA}retry${NC} retry failed"
     echo -e "          ${YELLOW}p${NC} pause | ${GREEN}resume${NC} | ${CYAN}cc${NC} clear completed | ${RED}b${NC} back"
+    echo -e "Download: ${RED}kd${NC} kill & delete | ${YELLOW}kp${NC} kill & re-queue | ${MAGENTA}ka${NC} kill all"
     echo ""
     read -p "Action: " status_input
     
@@ -377,6 +378,36 @@ show_status() {
             ;;
         b|back|q)
             return
+            ;;
+        kd)
+            # Kill downloads and delete from queue
+            pkill -f "rclone copy" 2>/dev/null
+            local tmp_file=$(mktemp)
+            jq '.downloading = []' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+            echo -e "${RED}Downloads killed and removed from queue.${NC}"
+            sleep 1
+            show_status
+            ;;
+        kp)
+            # Kill downloads and move back to pending
+            pkill -f "rclone copy" 2>/dev/null
+            local tmp_file=$(mktemp)
+            jq '.pending = .downloading + .pending | .downloading = []' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+            echo -e "${YELLOW}Downloads killed and moved back to pending queue.${NC}"
+            sleep 1
+            show_status
+            ;;
+        ka)
+            # Kill all (worker + rclone) and pause
+            pkill -f "rclone_worker.sh" 2>/dev/null
+            pkill -f "rclone copy" 2>/dev/null
+            rm -f "$WORKER_PID_FILE"
+            local tmp_file=$(mktemp)
+            jq '.pending = .downloading + .pending | .downloading = [] | .paused = true' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+            echo -e "${RED}All downloads killed, queue paused.${NC}"
+            echo -e "Use ${GREEN}resume${NC} to restart."
+            sleep 2
+            show_status
             ;;
         *)
             show_status

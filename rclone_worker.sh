@@ -6,14 +6,12 @@
 # =============================================================================
 
 # --- CONFIGURATION ---
-BASE_REMOTE_NAME="pikpak"
 LOG_DIR="$HOME/rclone_log"
 LOG_FILE="$LOG_DIR/rclone_log.log"
 QUEUE_FILE="$LOG_DIR/rclone_queue.json"
 WORKER_PID_FILE="$LOG_DIR/worker.pid"
 MAX_RETRIES=3
-SIZE_THRESHOLD=$((2 * 1024 * 1024 * 1024))  # 2GB in bytes
-POLL_INTERVAL=5  # seconds to wait before checking queue again
+POLL_INTERVAL=5
 
 # =============================================================================
 # LOGGING
@@ -31,190 +29,116 @@ log_error() {
     log "ERROR: $1"
 }
 
-log_debug() {
-    log "DEBUG: $1"
-}
-
 # =============================================================================
-# QUEUE OPERATIONS (Thread-safe with file locking)
+# QUEUE OPERATIONS
 # =============================================================================
 
-lock_queue() {
-    exec 200>"${QUEUE_FILE}.lock"
-    flock -x 200
-}
-
-unlock_queue() {
-    flock -u 200
-}
-
-get_queue() {
-    cat "$QUEUE_FILE"
+get_pending_count() {
+    jq '.pending | length' "$QUEUE_FILE" 2>/dev/null || echo "0"
 }
 
 is_paused() {
-    jq -r '.paused' "$QUEUE_FILE"
+    jq -r '.paused' "$QUEUE_FILE" 2>/dev/null || echo "false"
 }
 
-get_pending_count() {
-    jq '.pending | length' "$QUEUE_FILE"
-}
-
-get_downloading_count() {
-    jq '.downloading | length' "$QUEUE_FILE"
-}
-
-# Move item from pending to downloading
-start_download() {
-    local item_id="$1"
-    lock_queue
+# Get and remove items from pending (atomic operation)
+pop_items() {
+    local count=$1
     local tmp_file=$(mktemp)
-    jq --arg id "$item_id" '
-        .downloading += [.pending[] | select(.id == $id)] |
-        .pending = [.pending[] | select(.id != $id)]
-    ' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
-    unlock_queue
+    
+    # Get items and remove them from pending in one operation
+    local items=$(jq -c ".pending[0:$count]" "$QUEUE_FILE")
+    jq ".pending = .pending[$count:]" "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+    
+    echo "$items"
 }
 
-# Move item from downloading to completed
-complete_download() {
-    local item_id="$1"
-    lock_queue
+# Mark item as completed
+mark_completed() {
+    local item_json="$1"
     local tmp_file=$(mktemp)
     local timestamp=$(date -Iseconds)
-    jq --arg id "$item_id" --arg ts "$timestamp" '
-        .completed += [.downloading[] | select(.id == $id) | .completed_at = $ts] |
-        .downloading = [.downloading[] | select(.id != $id)]
-    ' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
-    unlock_queue
+    
+    jq --argjson item "$item_json" --arg ts "$timestamp" \
+        '.completed += [$item + {completed_at: $ts}]' \
+        "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
 }
 
-# Move item from downloading to failed (or back to pending for retry)
-fail_download() {
-    local item_id="$1"
-    lock_queue
-    
+# Mark item as failed or retry
+mark_failed_or_retry() {
+    local item_json="$1"
     local tmp_file=$(mktemp)
-    local current_retries=$(jq -r --arg id "$item_id" '.downloading[] | select(.id == $id) | .retries' "$QUEUE_FILE")
+    
+    local current_retries=$(echo "$item_json" | jq -r '.retries')
     local new_retries=$((current_retries + 1))
     
     if [[ $new_retries -lt $MAX_RETRIES ]]; then
-        # Move back to pending with incremented retry count
-        jq --arg id "$item_id" --argjson retries "$new_retries" '
-            .pending += [.downloading[] | select(.id == $id) | .retries = $retries] |
-            .downloading = [.downloading[] | select(.id != $id)]
-        ' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
-        log_info "Item $item_id failed, retry $new_retries/$MAX_RETRIES"
+        # Add back to pending with incremented retry
+        jq --argjson item "$item_json" --argjson retries "$new_retries" \
+            '.pending += [$item | .retries = $retries]' \
+            "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+        log_info "Retry $new_retries/$MAX_RETRIES queued"
     else
         # Move to failed
         local timestamp=$(date -Iseconds)
-        jq --arg id "$item_id" --arg ts "$timestamp" '
-            .failed += [.downloading[] | select(.id == $id) | .failed_at = $ts] |
-            .downloading = [.downloading[] | select(.id != $id)]
-        ' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
-        log_error "Item $item_id failed after $MAX_RETRIES retries, moved to failed list"
+        jq --argjson item "$item_json" --arg ts "$timestamp" \
+            '.failed += [$item + {failed_at: $ts}]' \
+            "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+        log_error "Max retries reached, moved to failed"
     fi
-    
-    unlock_queue
 }
 
-# Get next items to download based on queue state
-get_next_items() {
-    local pending_count=$(get_pending_count)
-    local downloading_count=$(get_downloading_count)
-    
-    # Calculate how many slots are available (max 2 concurrent)
-    local available_slots=$((2 - downloading_count))
-    
-    if [[ $available_slots -le 0 ]]; then
-        echo ""
-        return
-    fi
-    
-    if [[ $pending_count -eq 0 ]]; then
-        echo ""
-        return
-    fi
-    
-    # Get next item(s) from pending
-    if [[ $pending_count -eq 1 ]]; then
-        # Only 1 item in queue - return it (will use 2 streams)
-        jq -c '.pending[0]' "$QUEUE_FILE"
-    else
-        # Multiple items - return up to $available_slots items (will use 1 stream each)
-        jq -c ".pending[0:$available_slots][]" "$QUEUE_FILE"
-    fi
+# Update downloading status (for display only)
+set_downloading() {
+    local items_json="$1"
+    local tmp_file=$(mktemp)
+    jq --argjson items "$items_json" '.downloading = $items' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
+}
+
+clear_downloading() {
+    local tmp_file=$(mktemp)
+    jq '.downloading = []' "$QUEUE_FILE" > "$tmp_file" && mv "$tmp_file" "$QUEUE_FILE"
 }
 
 # =============================================================================
 # DOWNLOAD FUNCTIONS
 # =============================================================================
 
-download_file() {
+download_single_file() {
     local item_json="$1"
     local use_multithread="$2"
     
-    local item_id=$(echo "$item_json" | jq -r '.id')
     local remote_path=$(echo "$item_json" | jq -r '.remote_path')
     local local_path=$(echo "$item_json" | jq -r '.local_path')
     local filename=$(echo "$item_json" | jq -r '.filename')
     local file_size=$(echo "$item_json" | jq -r '.size')
     
-    # Ensure local directory exists
     local local_dir=$(dirname "$local_path")
     mkdir -p "$local_dir"
     
-    log_info "Starting download: $filename ($(format_size $file_size))"
-    log_debug "Remote: $remote_path"
-    log_debug "Local: $local_path"
-    log_debug "Multi-thread: $use_multithread"
+    local size_mb=$((file_size / 1048576))
+    log_info "Downloading: $filename (${size_mb}MB) [multithread=$use_multithread]"
     
-    # Mark as downloading
-    start_download "$item_id"
+    local streams=1
+    [[ "$use_multithread" == "true" ]] && streams=2
     
-    # Build rclone command
-    local rclone_cmd="rclone copy"
-    
-    if [[ "$use_multithread" == "true" ]]; then
-        # Single file, use 2 streams
-        rclone_cmd="$rclone_cmd --multi-thread-streams 2 --multi-thread-cutoff 0"
-    else
-        # Multiple files, use 1 stream
-        rclone_cmd="$rclone_cmd --multi-thread-streams 1"
-    fi
-    
-    # Execute download
-    # Note: We copy to parent directory and rclone will create the file
-    local parent_remote=$(dirname "$remote_path")
-    local file_basename=$(basename "$remote_path")
-    
-    if $rclone_cmd "$remote_path" "$local_dir" \
+    if rclone copy "$remote_path" "$local_dir" \
+        --multi-thread-streams $streams \
+        --multi-thread-cutoff 0 \
+        --timeout 5m \
+        --contimeout 60s \
+        --low-level-retries 3 \
+        --retries 1 \
         --stats=30s \
         --stats-one-line \
         --log-file="$LOG_FILE" \
         --log-level=INFO \
         2>&1; then
-        
-        log_info "Download completed: $filename"
-        complete_download "$item_id"
+        log_info "Completed: $filename"
         return 0
     else
-        log_error "Download failed: $filename"
-        fail_download "$item_id"
+        log_error "Failed: $filename"
         return 1
-    fi
-}
-
-format_size() {
-    local bytes=$1
-    if [[ $bytes -ge 1073741824 ]]; then
-        echo "$(awk "BEGIN {printf \"%.2f\", $bytes/1073741824}")GB"
-    elif [[ $bytes -ge 1048576 ]]; then
-        echo "$(awk "BEGIN {printf \"%.2f\", $bytes/1048576}")MB"
-    elif [[ $bytes -ge 1024 ]]; then
-        echo "$(awk "BEGIN {printf \"%.2f\", $bytes/1024}")KB"
-    else
-        echo "${bytes}B"
     fi
 }
 
@@ -224,108 +148,110 @@ format_size() {
 
 cleanup() {
     log_info "Worker shutting down..."
+    clear_downloading
     rm -f "$WORKER_PID_FILE"
     exit 0
 }
 
-trap cleanup SIGTERM SIGINT
+trap cleanup SIGTERM SIGINT EXIT
 
 main() {
     log_info "=========================================="
     log_info "Worker started (PID: $$)"
     log_info "=========================================="
     
-    # Store PID
     echo $$ > "$WORKER_PID_FILE"
     
     local idle_count=0
-    local max_idle=12  # Exit after ~60 seconds of no work (12 * 5s)
+    local max_idle=12  # Exit after ~60 seconds idle
     
     while true; do
-        # Check if paused
+        # Check pause
         if [[ $(is_paused) == "true" ]]; then
-            log_debug "Queue is paused, waiting..."
             sleep $POLL_INTERVAL
             continue
         fi
         
         local pending_count=$(get_pending_count)
-        local downloading_count=$(get_downloading_count)
         
-        # If nothing pending and nothing downloading, increment idle counter
-        if [[ $pending_count -eq 0 && $downloading_count -eq 0 ]]; then
+        # Idle check
+        if [[ $pending_count -eq 0 ]]; then
             ((idle_count++))
-            log_debug "Idle count: $idle_count / $max_idle"
-            
             if [[ $idle_count -ge $max_idle ]]; then
-                log_info "Queue empty for extended period, worker exiting."
-                cleanup
+                log_info "Queue empty, worker exiting."
+                exit 0
             fi
-            
             sleep $POLL_INTERVAL
             continue
         fi
         
-        # Reset idle counter if there's work
         idle_count=0
         
-        # Skip if already at max concurrent downloads
-        if [[ $downloading_count -ge 2 ]]; then
-            log_debug "Max concurrent downloads reached, waiting..."
-            sleep $POLL_INTERVAL
-            continue
-        fi
-        
-        # Get items to download
-        if [[ $pending_count -eq 0 ]]; then
-            # Nothing to start, but downloads in progress
-            sleep $POLL_INTERVAL
-            continue
-        fi
-        
-        # Determine download strategy
-        local total_active=$((pending_count + downloading_count))
-        local use_multithread="false"
-        
-        # If only 1 item total (pending + downloading), use multithread
-        if [[ $total_active -eq 1 && $downloading_count -eq 0 ]]; then
-            use_multithread="true"
-        fi
-        
-        # Get next item(s)
-        local available_slots=$((2 - downloading_count))
-        
-        if [[ "$use_multithread" == "true" ]]; then
-            # Single item mode - download with 2 streams (blocking)
-            local item=$(jq -c '.pending[0]' "$QUEUE_FILE")
-            if [[ -n "$item" && "$item" != "null" ]]; then
-                download_file "$item" "true"
+        # Decide strategy: 1 file = 2 streams, 2+ files = 2 files x 1 stream
+        if [[ $pending_count -eq 1 ]]; then
+            # Single file mode: 2 streams
+            local items=$(pop_items 1)
+            local item=$(echo "$items" | jq -c '.[0]')
+            
+            set_downloading "$items"
+            
+            if download_single_file "$item" "true"; then
+                mark_completed "$item"
+            else
+                mark_failed_or_retry "$item"
             fi
+            
+            clear_downloading
+            
         else
-            # Multi-item mode - download up to 2 items with 1 stream each
-            local items_to_download=()
-            local pids=()
+            # Multi file mode: 2 files, 1 stream each
+            local items=$(pop_items 2)
+            local item1=$(echo "$items" | jq -c '.[0]')
+            local item2=$(echo "$items" | jq -c '.[1] // empty')
             
-            while IFS= read -r item; do
-                if [[ -n "$item" && "$item" != "null" ]]; then
-                    items_to_download+=("$item")
+            set_downloading "$items"
+            
+            # Download in parallel
+            local pid1="" pid2=""
+            local result1=0 result2=0
+            
+            download_single_file "$item1" "false" &
+            pid1=$!
+            
+            if [[ -n "$item2" && "$item2" != "null" ]]; then
+                sleep 1
+                download_single_file "$item2" "false" &
+                pid2=$!
+            fi
+            
+            # Wait and collect results
+            wait $pid1
+            result1=$?
+            
+            if [[ -n "$pid2" ]]; then
+                wait $pid2
+                result2=$?
+            fi
+            
+            clear_downloading
+            
+            # Process results
+            if [[ $result1 -eq 0 ]]; then
+                mark_completed "$item1"
+            else
+                mark_failed_or_retry "$item1"
+            fi
+            
+            if [[ -n "$item2" && "$item2" != "null" ]]; then
+                if [[ $result2 -eq 0 ]]; then
+                    mark_completed "$item2"
+                else
+                    mark_failed_or_retry "$item2"
                 fi
-            done < <(jq -c ".pending[0:$available_slots][]" "$QUEUE_FILE")
-            
-            # Start downloads in background and collect PIDs
-            for item in "${items_to_download[@]}"; do
-                download_file "$item" "false" &
-                pids+=($!)
-                sleep 1  # Small delay between starting downloads
-            done
-            
-            # Wait for ALL downloads to complete before continuing
-            for pid in "${pids[@]}"; do
-                wait $pid
-            done
+            fi
         fi
         
-        # Brief pause before next iteration
+        # Brief pause between batches
         sleep 2
     done
 }
